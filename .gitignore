@@ -103,3 +103,6 @@ venv.bak/
 .vscode/
 *.swp
 *.swo
+
+long_video_results/
+temp_youtube_downloads/

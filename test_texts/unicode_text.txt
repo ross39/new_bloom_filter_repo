@@ -1,0 +1,5 @@
+
+            Unicode includes symbols like: ☀ ☁ ☂ ☃ ☄ ★ ☆ ☉ ☘ ☺ ☻
+            And languages like: 你好 (Chinese), こんにちは (Japanese), 안녕하세요 (Korean)
+            Plus emojis: 😀 😁 😂 😃 😄 😅 😆 😇
+        

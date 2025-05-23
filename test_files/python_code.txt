@@ -1,0 +1,27 @@
+
+import numpy as np
+import matplotlib.pyplot as plt
+from typing import List, Tuple, Optional
+
+def calculate_fibonacci(n: int) -> List[int]:
+    # Return the first n Fibonacci numbers.
+    fib = [0, 1]
+    for i in range(2, n):
+        fib.append(fib[i-1] + fib[i-2])
+    return fib
+
+def plot_fibonacci(n: int, save_path: Optional[str] = None) -> None:
+    # Plot the first n Fibonacci numbers.
+    fib = calculate_fibonacci(n)
+    plt.figure(figsize=(10, 6))
+    plt.plot(range(n), fib, 'o-')
+    plt.title(f"First {n} Fibonacci Numbers")
+    plt.xlabel("Index")
+    plt.ylabel("Value")
+    plt.grid(True)
+    if save_path:
+        plt.savefig(save_path)
+    plt.show()
+
+if __name__ == "__main__":
+    plot_fibonacci(20, "fibonacci.png")

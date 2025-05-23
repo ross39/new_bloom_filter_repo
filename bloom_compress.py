@@ -34,11 +34,15 @@ class BloomFilterCompressor:
         
         Args:
             n: Length of the binary input string
-            p: Density (probability of '1' bits) in the input
+            p: Density (probability of '1' bits)
             
         Returns:
             Tuple of (k, l) where k is optimal hash count and l is optimal filter length
         """
+        # Handle edge case of zero or very small density
+        if p <= 0.0001:
+            return 0, 0
+        
         if p >= BloomFilterCompressor.P_STAR:
             # Compression not effective for this density
             return 0, 0
@@ -48,6 +52,10 @@ class BloomFilterCompressor:
         
         # Calculate optimal k 
         k = math.log2(q * (L**2) / p)
+        
+        # Ensure k is valid
+        if math.isnan(k) or k <= 0:
+            return 0, 0
         
         # Calculate optimal filter length
         gamma = 1 / L
@@ -77,6 +85,61 @@ class BloomFilterCompressor:
         
         # Flatten to 1D array
         return binary_image.flatten()
+    
+    @staticmethod
+    def _binarize_text(text: str, bit_depth: int = 8) -> np.ndarray:
+        """
+        Convert text to a binary representation.
+        
+        Args:
+            text: Input text string
+            bit_depth: Number of bits to use per character (8 for ASCII, 16 for Unicode)
+            
+        Returns:
+            Binary representation of the text as 1D numpy array of 0s and 1s
+        """
+        # Convert text to bytes
+        if bit_depth == 8:
+            # ASCII encoding
+            bytes_data = text.encode('ascii', errors='replace')
+        else:
+            # Unicode encoding
+            bytes_data = text.encode('utf-8')
+        
+        # Convert bytes to binary array
+        binary_array = np.unpackbits(np.frombuffer(bytes_data, dtype=np.uint8))
+        
+        return binary_array
+    
+    @staticmethod
+    def _debinarize_text(binary_array: np.ndarray, bit_depth: int = 8) -> str:
+        """
+        Convert binary representation back to text.
+        
+        Args:
+            binary_array: Binary array (1D)
+            bit_depth: Number of bits per character used in binarization
+            
+        Returns:
+            Reconstructed text string
+        """
+        # Ensure the array length is a multiple of 8 (one byte)
+        pad_length = 8 - (len(binary_array) % 8) if len(binary_array) % 8 != 0 else 0
+        if pad_length > 0:
+            binary_array = np.pad(binary_array, (0, pad_length), 'constant')
+        
+        # Convert binary array to bytes
+        bytes_data = np.packbits(binary_array).tobytes()
+        
+        # Convert bytes back to text
+        if bit_depth == 8:
+            # ASCII encoding
+            text = bytes_data.decode('ascii', errors='replace')
+        else:
+            # Unicode encoding
+            text = bytes_data.decode('utf-8', errors='replace')
+        
+        return text
     
     class RationalBloomFilter:
         """
@@ -423,6 +486,136 @@ class BloomFilterCompressor:
         witness = witness_bits[:witness_len].tolist()  # Trim to exact size
         
         return bloom_bitmap, witness, p, n, k, original_shape
+    
+    def compress_text(self, text: str, bit_depth: int = 8, 
+                     output_path: Optional[str] = None) -> Tuple[bytes, float]:
+        """
+        Compress text using Bloom filter compression.
+        
+        Args:
+            text: Input text string
+            bit_depth: Number of bits per character (8 for ASCII, 16 for Unicode)
+            output_path: Optional path to save the compressed data
+            
+        Returns:
+            Tuple of (compressed_data_bytes, compression_ratio)
+        """
+        # Binarize the text
+        binary_data = self._binarize_text(text, bit_depth)
+        
+        # Compress the binary data
+        bloom_bitmap, witness, p, n, compression_ratio = self.compress(binary_data)
+        
+        # Calculate optimal k for the given density
+        k, _ = self._calculate_optimal_params(n, p)
+        
+        # Store the original text length for verification
+        text_length = len(text)
+        
+        # Pack the compressed data
+        compressed_data = self._pack_text_data(
+            bloom_bitmap, witness, p, n, k, text_length, bit_depth)
+        
+        # Save if output path provided
+        if output_path:
+            with open(output_path, 'wb') as f:
+                f.write(compressed_data)
+        
+        return compressed_data, compression_ratio
+    
+    def decompress_text(self, compressed_data: bytes, 
+                       output_path: Optional[str] = None) -> str:
+        """
+        Decompress text that was compressed with Bloom filter compression.
+        
+        Args:
+            compressed_data: The compressed data bytes
+            output_path: Optional path to save the decompressed text
+            
+        Returns:
+            The decompressed text string
+        """
+        # Unpack the compressed data
+        bloom_bitmap, witness, p, n, k, text_length, bit_depth = self._unpack_text_data(compressed_data)
+        
+        # Decompress the binary data
+        decompressed_binary = self.decompress(bloom_bitmap, witness, n, k)
+        
+        # Convert binary back to text
+        decompressed_text = self._debinarize_text(decompressed_binary, bit_depth)
+        
+        # Truncate to original length (in case of padding)
+        decompressed_text = decompressed_text[:text_length]
+        
+        # Save if output path provided
+        if output_path:
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(decompressed_text)
+        
+        return decompressed_text
+    
+    def _pack_text_data(self, bloom_bitmap: np.ndarray, witness: list, 
+                       p: float, n: int, k: float, 
+                       text_length: int, bit_depth: int) -> bytes:
+        """Pack the compressed text data into a binary format for storage."""
+        buffer = io.BytesIO()
+        
+        # Write header
+        buffer.write(struct.pack('!f', p))  # Density
+        buffer.write(struct.pack('!I', n))  # Original binary length
+        buffer.write(struct.pack('!f', k))  # Hash function count
+        buffer.write(struct.pack('!I', text_length))  # Original text length
+        buffer.write(struct.pack('!B', bit_depth))  # Bit depth used
+        
+        # Write Bloom filter bitmap size
+        l = len(bloom_bitmap)
+        buffer.write(struct.pack('!I', l))
+        
+        # Write witness size
+        witness_len = len(witness)
+        buffer.write(struct.pack('!I', witness_len))
+        
+        # Pack bloom filter bitmap into bytes
+        bloom_bytes = np.packbits(bloom_bitmap)
+        buffer.write(bloom_bytes.tobytes())
+        
+        # Pack witness data into bytes
+        witness_array = np.array(witness, dtype=np.uint8)
+        witness_bytes = np.packbits(witness_array)
+        buffer.write(witness_bytes.tobytes())
+        
+        return buffer.getvalue()
+    
+    def _unpack_text_data(self, data: bytes) -> Tuple:
+        """Unpack the compressed text data from binary format."""
+        buffer = io.BytesIO(data)
+        
+        # Read header
+        p = struct.unpack('!f', buffer.read(4))[0]
+        n = struct.unpack('!I', buffer.read(4))[0]
+        k = struct.unpack('!f', buffer.read(4))[0]
+        text_length = struct.unpack('!I', buffer.read(4))[0]
+        bit_depth = struct.unpack('!B', buffer.read(1))[0]
+        
+        # Read Bloom filter bitmap size
+        l = struct.unpack('!I', buffer.read(4))[0]
+        
+        # Read witness size
+        witness_len = struct.unpack('!I', buffer.read(4))[0]
+        
+        # Calculate bytes needed for bloom filter
+        bloom_bytes_len = (l + 7) // 8  # Ceiling division by 8
+        bloom_bytes = buffer.read(bloom_bytes_len)
+        bloom_bits = np.unpackbits(np.frombuffer(bloom_bytes, dtype=np.uint8))
+        bloom_bitmap = bloom_bits[:l]  # Trim to exact size
+        
+        # Calculate bytes needed for witness
+        witness_bytes_len = (witness_len + 7) // 8  # Ceiling division by 8
+        witness_bytes = buffer.read(witness_bytes_len)
+        witness_bits = np.unpackbits(np.frombuffer(witness_bytes, dtype=np.uint8))
+        witness = witness_bits[:witness_len].tolist()  # Trim to exact size
+        
+        return bloom_bitmap, witness, p, n, k, text_length, bit_depth
 
 
 def run_compression_tests():

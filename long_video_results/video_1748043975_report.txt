@@ -1,0 +1,19 @@
+=== Bloom Filter Video Compression Report ===
+
+Video Statistics:
+  Frame count: 84
+  Frame dimensions: 50x89
+  Original size: 373,800 bytes
+  Compressed size: 52,261 bytes
+  Compression ratio: 0.139810
+  Space savings: 86.02%
+
+Performance Metrics:
+  Compression time: 0.68 seconds
+  Frames per second: 123.98
+  Bytes per frame: 622.15
+
+Bloom Filter Statistics:
+  Number of keyframes: 13
+  Average frame difference density: 0.081714
+  Average per-frame compression ratio: 0.530621

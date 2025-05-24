@@ -1,0 +1,16 @@
+=== Performance Metrics ===
+
+original_grayscale_size: 1548288
+original_color_size: 4644864
+compressed_grayscale_size: 820312
+compressed_color_size: 1250644
+total_compressed_size: 2070956
+grayscale_compression_ratio: 0.5298187417328042
+color_compression_ratio: 0.26925309330908287
+total_compression_ratio: 0.44585934055335097
+grayscale_compression_time: 0.9412600994110107
+color_compression_time: 0.08711409568786621
+total_compression_time: 1.0283901691436768
+frames_per_second: 163.3621217323487
+bytes_per_frame: 12327.119047619048
+decompression_time: 0.9151401519775391

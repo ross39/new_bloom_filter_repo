@@ -1,0 +1,31 @@
+=== Bloom Filter Video Compression Report with Color Preservation ===
+
+Video Statistics:
+  Frame count: 168
+  Frame dimensions: 72x128
+
+Size Metrics:
+  Original color size: 4,644,864 bytes
+  Grayscale compressed size: 820,312 bytes
+  Color data compressed size: 1,250,644 bytes
+  Total compressed size: 2,070,956 bytes
+
+Compression Ratios:
+  Grayscale compression ratio: 0.529819
+  Color compression ratio: 0.269253
+  Total compression ratio: 0.445859
+  Space savings: 55.41%
+
+Performance Metrics:
+  Grayscale compression time: 0.94 seconds
+  Color compression time: 0.09 seconds
+  Total compression time: 1.03 seconds
+  Frames per second: 162.82
+  Bytes per frame: 12327.12
+
+Color Preservation Settings:
+  Chrominance downscaling: 0.5
+
+Bloom Filter Statistics:
+  Number of keyframes: 125
+  Average frame difference density: 0.230885

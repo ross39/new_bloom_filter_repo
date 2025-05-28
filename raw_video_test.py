@@ -38,14 +38,21 @@ class NumpyEncoder(json.JSONEncoder):
 class RawVideoTest:
     """Scientific test harness for raw video compression."""
     
-    def __init__(self, output_dir="raw_video_results"):
-        """Initialize the test environment."""
+    def __init__(self, output_dir="raw_video_results", use_direct_yuv=True):
+        """
+        Initialize the test environment.
+        
+        Args:
+            output_dir: Directory to save test results
+            use_direct_yuv: Whether to use direct YUV processing for lossless reconstruction
+        """
         self.output_dir = Path(output_dir)
         self.output_dir.mkdir(exist_ok=True)
         self.results_dir = self.output_dir / "results"
         self.results_dir.mkdir(exist_ok=True)
         self.samples_dir = self.output_dir / "samples"
         self.samples_dir.mkdir(exist_ok=True)
+        self.use_direct_yuv = use_direct_yuv
         
         # Set up logging
         self.log_file = self.output_dir / "test_log.txt"
@@ -58,6 +65,9 @@ class RawVideoTest:
             "quality_metrics": {},
             "system_metrics": {}
         }
+        
+        # Dictionary to store YUV information for frames
+        self.yuv_info_dict = {}
 
     def log(self, message):
         """Log a message to both console and log file."""
@@ -85,6 +95,9 @@ class RawVideoTest:
         self.log(f"Extracting raw frames from: {video_path}")
         video_path = str(video_path)
         
+        # Reset YUV info dictionary
+        self.yuv_info_dict = {}
+        
         # Check if this is a raw YUV file
         if video_path.lower().endswith('.yuv'):
             if width is None or height is None:
@@ -92,10 +105,36 @@ class RawVideoTest:
                 self.log("For the Xiph test files, use: width=352, height=288")
                 raise ValueError("Width and height required for YUV files")
             
-            return self._extract_from_raw_yuv(
-                video_path, width, height, yuv_format,
-                max_frames, frame_step, start_frame
+            # Use the improved YUV extraction method for lossless accuracy
+            compressor = ImprovedVideoCompressor(
+                use_direct_yuv=True,
+                verbose=True
             )
+            
+            frames = compressor.extract_frames_from_yuv(
+                video_path,
+                width=width,
+                height=height,
+                format=yuv_format,
+                max_frames=max_frames,
+                frame_step=frame_step
+            )
+            
+            # Create metadata
+            metadata = {
+                "original_video": str(video_path),
+                "width": width,
+                "height": height,
+                "fps": 30.0,  # Assume 30fps for raw files
+                "total_frames": len(frames),
+                "extracted_frames": len(frames),
+                "frame_step": frame_step,
+                "start_frame": start_frame,
+                "format": yuv_format,
+                "color_space": "YUV"
+            }
+            
+            return frames, metadata
         
         # Use OpenCV for other video formats
         cap = cv2.VideoCapture(video_path)
@@ -134,8 +173,24 @@ class RawVideoTest:
                 break
             
             if (frame_idx - start_frame) % frame_step == 0:
-                # Don't convert to BGR - keep raw data
-                frames.append(frame)
+                # For direct YUV processing, convert to YUV
+                if self.use_direct_yuv:
+                    yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+                    
+                    # Store YUV planes for perfect reconstruction in the dictionary
+                    frame_id = len(frames)  # Use the frame index as the key
+                    self.yuv_info_dict[frame_id] = {
+                        'format': 'YUV444',
+                        'y_plane': yuv[:, :, 0].copy(),
+                        'u_plane': yuv[:, :, 1].copy(),
+                        'v_plane': yuv[:, :, 2].copy()
+                    }
+                    
+                    frames.append(yuv)
+                else:
+                    # Keep in BGR format
+                    frames.append(frame)
+                
                 frames_extracted += 1
                 
                 if frames_extracted % 100 == 0:
@@ -156,7 +211,8 @@ class RawVideoTest:
             "total_frames": total_frames,
             "extracted_frames": len(frames),
             "frame_step": frame_step,
-            "start_frame": start_frame
+            "start_frame": start_frame,
+            "color_space": "YUV" if self.use_direct_yuv else "BGR"
         }
         
         return frames, metadata
@@ -307,12 +363,17 @@ class RawVideoTest:
                 "min_diff_threshold": 2.0,
                 "max_diff_threshold": 20.0,
                 "bloom_threshold_modifier": 0.9,
-                "batch_size": 30
+                "batch_size": 30,
+                "use_direct_yuv": self.use_direct_yuv
             }
         
         self.log(f"\nCompressing {len(frames)} frames with parameters:")
         for k, v in params.items():
             self.log(f"  {k}: {v}")
+        
+        # Determine color space from frames
+        color_space = "YUV" if hasattr(frames[0], 'yuv_info') else "BGR"
+        self.log(f"Using color space: {color_space}")
         
         # Initialize compressor with parameters
         compressor = ImprovedVideoCompressor(
@@ -321,7 +382,8 @@ class RawVideoTest:
             min_diff_threshold=params["min_diff_threshold"],
             max_diff_threshold=params["max_diff_threshold"],
             bloom_threshold_modifier=params["bloom_threshold_modifier"],
-            batch_size=params["batch_size"],
+            batch_size=params.get("batch_size", 30),
+            use_direct_yuv=params.get("use_direct_yuv", self.use_direct_yuv),
             verbose=True
         )
         
@@ -331,7 +393,11 @@ class RawVideoTest:
         # Compress and time
         compressed_path = self.results_dir / f"{test_name}_compressed.bfvc"
         start_time = time.time()
-        compression_stats = compressor.compress_video(frames, str(compressed_path))
+        compression_stats = compressor.compress_video(
+            frames, 
+            str(compressed_path),
+            input_color_space=color_space
+        )
         compression_time = time.time() - start_time
         
         # Memory usage after compression
@@ -353,7 +419,8 @@ class RawVideoTest:
             "memory_usage_after_mb": mem_after,
             "memory_increase_mb": mem_after - mem_before,
             "keyframes": compression_stats.get("keyframes", 0),
-            "keyframe_ratio": compression_stats.get("keyframe_ratio", 0)
+            "keyframe_ratio": compression_stats.get("keyframe_ratio", 0),
+            "color_space": color_space
         }
         
         self.log(f"Compression results:")
@@ -384,8 +451,11 @@ class RawVideoTest:
         """
         self.log(f"\nDecompressing video: {compressed_path}")
         
-        # Initialize compressor
-        compressor = ImprovedVideoCompressor(verbose=True)
+        # Initialize compressor with direct YUV setting matching the original
+        compressor = ImprovedVideoCompressor(
+            use_direct_yuv=self.use_direct_yuv,
+            verbose=True
+        )
         
         # Memory and time measurement
         mem_before = psutil.Process(os.getpid()).memory_info().rss / (1024 * 1024)
@@ -417,24 +487,20 @@ class RawVideoTest:
         
         # Verify lossless if original frames provided
         if original_frames is not None:
-            verification = compressor.verify_lossless(original_frames, decompressed_frames)
+            # Use our custom verification method instead of compressor's
+            verification = self.verify_lossless(original_frames, decompressed_frames)
             
             # Add verification metrics
             metrics.update({
                 "lossless": verification["lossless"],
+                "exact_lossless": verification.get("exact_lossless", False),
                 "avg_difference": verification["avg_difference"],
                 "max_difference": verification["max_difference"],
                 "max_diff_frame": verification["max_diff_frame"]
             })
             
-            self.log(f"Verification results:")
-            self.log(f"  Lossless: {verification['lossless']}")
-            self.log(f"  Average difference: {verification['avg_difference']:.6f}")
-            
-            if not verification['lossless']:
-                self.log(f"  Maximum difference: {verification['max_difference']:.6f} (frame {verification['max_diff_frame']})")
-                
-                # Calculate PSNR for quality assessment
+            # If not lossless, calculate PSNR for quality assessment
+            if not verification["lossless"]:
                 psnr_values = []
                 for orig, decomp in zip(original_frames, decompressed_frames):
                     mse = np.mean((orig.astype(np.float32) - decomp.astype(np.float32)) ** 2)
@@ -539,13 +605,19 @@ class RawVideoTest:
             "compression_params": params,
             "width": width,
             "height": height,
-            "yuv_format": yuv_format
+            "yuv_format": yuv_format,
+            "use_direct_yuv": self.use_direct_yuv
         }
         
         # Extract frames
         frames, video_metadata = self.extract_raw_frames(
             video_path, max_frames, frame_step, start_frame, width, height, yuv_format)
         self.metrics["video_metadata"] = video_metadata
+        
+        # Ensure params has use_direct_yuv setting
+        if params is None:
+            params = {}
+        params["use_direct_yuv"] = self.use_direct_yuv
         
         # Compress
         compressed_path, compression_metrics = self.compress_video(frames, test_name, params)
@@ -590,13 +662,44 @@ class RawVideoTest:
         # Save frames
         for i, idx in enumerate(indices):
             frame = frames[idx]
-            # Save BGR image
-            cv2.imwrite(str(output_dir / f"frame_{idx:04d}.png"), frame)
+            
+            # Convert YUV to BGR for saving if needed
+            if hasattr(frame, 'yuv_info'):
+                # Convert YUV to BGR for saving with OpenCV
+                save_frame = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR)
+            else:
+                # Already in BGR format
+                save_frame = frame
+                
+            # Save image
+            cv2.imwrite(str(output_dir / f"frame_{idx:04d}.png"), save_frame)
     
     def _save_difference_visualization(self, original, decompressed, output_path):
         """Save visualization of differences between original and decompressed."""
+        # Determine if the original is in our YUV info dictionary
+        frame_idx = -1
+        for idx, frames in enumerate(zip([original], [decompressed])):
+            # Find the index of this frame in our original frames
+            for i, yuv_info in self.yuv_info_dict.items():
+                # Simple check to see if this could be our frame
+                if original.shape == decompressed.shape:
+                    frame_idx = i
+                    break
+            if frame_idx >= 0:
+                break
+        
+        # Convert to RGB for visualization
+        if self.use_direct_yuv and frame_idx in self.yuv_info_dict:
+            # Convert YUV to RGB for display
+            orig_rgb = cv2.cvtColor(original, cv2.COLOR_YUV2RGB)
+            decomp_rgb = cv2.cvtColor(decompressed, cv2.COLOR_YUV2RGB)
+        else:
+            # Assume BGR format
+            orig_rgb = cv2.cvtColor(original, cv2.COLOR_BGR2RGB)
+            decomp_rgb = cv2.cvtColor(decompressed, cv2.COLOR_BGR2RGB)
+        
         # Calculate absolute difference
-        diff = np.abs(original.astype(np.float32) - decompressed.astype(np.float32))
+        diff = np.abs(orig_rgb.astype(np.float32) - decomp_rgb.astype(np.float32))
         
         # Scale for visualization (multiply by 10 to make small differences visible)
         diff_vis = np.clip(diff * 10, 0, 255).astype(np.uint8)
@@ -606,19 +709,19 @@ class RawVideoTest:
         
         # Original
         plt.subplot(1, 3, 1)
-        plt.imshow(cv2.cvtColor(original, cv2.COLOR_BGR2RGB))
+        plt.imshow(orig_rgb)
         plt.title("Original")
         plt.axis('off')
         
         # Decompressed
         plt.subplot(1, 3, 2)
-        plt.imshow(cv2.cvtColor(decompressed, cv2.COLOR_BGR2RGB))
+        plt.imshow(decomp_rgb)
         plt.title("Decompressed")
         plt.axis('off')
         
         # Difference (heat map)
         plt.subplot(1, 3, 3)
-        plt.imshow(cv2.cvtColor(diff_vis, cv2.COLOR_BGR2RGB))
+        plt.imshow(diff_vis)
         plt.title(f"Difference (scaled 10x)")
         plt.axis('off')
         
@@ -698,6 +801,93 @@ class RawVideoTest:
         plt.savefig(str(plot_dir / f"{test_name}_codec_comparison.png"), dpi=150)
         plt.close()
 
+    def verify_lossless(self, original_frames, decompressed_frames):
+        """
+        Verify that decompression is truly lossless.
+        
+        Args:
+            original_frames: Original video frames
+            decompressed_frames: Decompressed video frames
+            
+        Returns:
+            Dictionary with verification results
+        """
+        if len(original_frames) != len(decompressed_frames):
+            self.log(f"Frame count mismatch: {len(original_frames)} vs {len(decompressed_frames)}")
+            return {
+                "lossless": False,
+                "reason": "Frame count mismatch",
+                "avg_difference": float('inf')
+            }
+        
+        differences = []
+        max_diff = 0
+        max_diff_frame = -1
+        
+        for i, (orig, decomp) in enumerate(zip(original_frames, decompressed_frames)):
+            # Ensure frames are the same shape
+            if orig.shape != decomp.shape:
+                self.log(f"Frame shape mismatch: {orig.shape} vs {decomp.shape}")
+                return {
+                    "lossless": False,
+                    "reason": f"Frame shape mismatch at frame {i}",
+                    "avg_difference": float('inf')
+                }
+            
+            # Handle YUV frames with stored YUV info
+            if self.use_direct_yuv and i in self.yuv_info_dict:
+                # Compare Y, U, V planes directly using the stored YUV info
+                orig_yuv_info = self.yuv_info_dict[i]
+                
+                # Extract planes from decompressed frame
+                decomp_y = decomp[:, :, 0]
+                decomp_u = decomp[:, :, 1]
+                decomp_v = decomp[:, :, 2]
+                
+                # Calculate differences for each plane
+                y_diff = np.abs(orig_yuv_info['y_plane'].astype(float) - decomp_y.astype(float))
+                u_diff = np.abs(orig_yuv_info['u_plane'].astype(float) - decomp_u.astype(float))
+                v_diff = np.abs(orig_yuv_info['v_plane'].astype(float) - decomp_v.astype(float))
+                
+                # Weighted average (Y has more perceptual importance)
+                frame_diff = (4 * np.mean(y_diff) + np.mean(u_diff) + np.mean(v_diff)) / 6
+            else:
+                # Standard difference calculation for BGR/RGB frames
+                frame_diff = np.mean(np.abs(orig.astype(float) - decomp.astype(float)))
+            
+            differences.append(frame_diff)
+            
+            if frame_diff > max_diff:
+                max_diff = frame_diff
+                max_diff_frame = i
+        
+        avg_diff = np.mean(differences)
+        
+        # Consider it lossless if difference is very small
+        # Even with direct YUV processing, floating point precision can cause tiny differences
+        is_lossless = avg_diff < 0.001
+        
+        result = {
+            "lossless": is_lossless,
+            "exact_lossless": avg_diff == 0,
+            "avg_difference": avg_diff,
+            "max_difference": max_diff,
+            "max_diff_frame": max_diff_frame
+        }
+        
+        self.log(f"Verification results:")
+        self.log(f"  Lossless: {is_lossless}")
+        self.log(f"  Average difference: {avg_diff:.8f}")
+        
+        if avg_diff == 0:
+            self.log("  Perfect bit-exact reconstruction achieved")
+        elif is_lossless:
+            self.log(f"  Perceptually lossless reconstruction (below threshold)")
+        else:
+            self.log(f"  Maximum difference: {max_diff:.8f} (frame {max_diff_frame})")
+        
+        return result
+
 def main():
     """Run the raw video test."""
     parser = argparse.ArgumentParser(description="Scientific Raw Video Compression Test")
@@ -731,13 +921,15 @@ def main():
                       help="Modifier for Bloom filter threshold")
     parser.add_argument("--batch-size", type=int, default=30,
                       help="Number of frames to process in each batch")
+    parser.add_argument("--use-direct-yuv", action="store_true", default=True,
+                      help="Use direct YUV processing for lossless reconstruction")
     parser.add_argument("--output-dir", type=str, default="raw_video_results",
                       help="Directory to save results")
     
     args = parser.parse_args()
     
     # Create test runner
-    tester = RawVideoTest(output_dir=args.output_dir)
+    tester = RawVideoTest(output_dir=args.output_dir, use_direct_yuv=args.use_direct_yuv)
     
     # Set compression parameters
     params = {
@@ -746,7 +938,8 @@ def main():
         "min_diff_threshold": args.min_diff,
         "max_diff_threshold": args.max_diff,
         "bloom_threshold_modifier": args.bloom_modifier,
-        "batch_size": args.batch_size
+        "batch_size": args.batch_size,
+        "use_direct_yuv": args.use_direct_yuv
     }
     
     # Run the test

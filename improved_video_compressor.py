@@ -306,6 +306,368 @@ class BloomFilterCompressor:
         
         return decompressed 
 
+class ImprovedVideoCompressor:
+    """
+    True Lossless Video Compression System
+    
+    This implementation ensures mathematically lossless video compression
+    with bit-exact reconstruction. It is based on the FixedVideoCompressor
+    approach for perfect fidelity.
+    """
+    
+    def __init__(self, 
+                noise_tolerance: float = 10.0,
+                keyframe_interval: int = 30,
+                min_diff_threshold: float = 3.0,
+                max_diff_threshold: float = 30.0,
+                bloom_threshold_modifier: float = 1.0,
+                batch_size: int = 30,
+                num_threads: int = None,
+                use_direct_yuv: bool = False,
+                verbose: bool = False):
+        """
+        Initialize the video compressor.
+        
+        Args:
+            noise_tolerance: Tolerance for noise in frame differences (higher = more tolerant)
+            keyframe_interval: Maximum number of frames between keyframes
+            min_diff_threshold: Minimum threshold for considering pixels different
+            max_diff_threshold: Maximum threshold for considering pixels different
+            bloom_threshold_modifier: Modifier for Bloom filter threshold
+            batch_size: Number of frames to process in each batch
+            num_threads: Number of threads to use for parallel processing
+            use_direct_yuv: Process YUV frames directly without conversion to avoid rounding errors
+            verbose: Whether to print detailed compression information
+        """
+        # Store parameters
+        self.noise_tolerance = noise_tolerance
+        self.keyframe_interval = keyframe_interval
+        self.min_diff_threshold = min_diff_threshold
+        self.max_diff_threshold = max_diff_threshold
+        self.bloom_threshold_modifier = bloom_threshold_modifier
+        self.batch_size = batch_size
+        self.use_direct_yuv = use_direct_yuv
+        self.verbose = verbose
+        
+        # Import fixed compressor
+        from fixed_video_compressor import FixedVideoCompressor
+        
+        # Create fixed compressor for true lossless compression
+        self.compressor = FixedVideoCompressor(verbose=verbose)
+        
+    def compress_video(self, frames: List[np.ndarray], 
+                     output_path: str = None,
+                     input_color_space: str = "BGR") -> Dict:
+        """
+        Compress video frames with accurate compression ratio calculation.
+        
+        Args:
+            frames: List of video frames
+            output_path: Path to save the compressed video
+            input_color_space: Color space of input frames ('BGR', 'RGB', 'YUV')
+            
+        Returns:
+            Dictionary with compression results and statistics
+        """
+        if not frames:
+            raise ValueError("No frames provided for compression")
+        
+        start_time = time.time()
+        
+        # Set YUV mode if needed
+        if input_color_space.upper() == "YUV":
+            self.use_direct_yuv = True
+            
+            # Add YUV info to frames if not already present
+            for i in range(len(frames)):
+                if not hasattr(frames[i], 'yuv_info'):
+                    frames[i] = self.compressor.add_yuv_info_to_frame(frames[i])
+        
+        # Calculate original size accurately
+        original_size = sum(frame.nbytes for frame in frames)
+        
+        # Compress frames
+        compressed_frames = self.compressor.compress_video(frames)
+        
+        # Save to file if requested
+        if output_path:
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            
+            # Write compressed data
+            with open(output_path, 'wb') as f:
+                # Write header
+                f.write(b'BFVC')  # Magic number
+                f.write(struct.pack('<I', len(frames)))  # Frame count
+                
+                # Write each compressed frame
+                for compressed_frame in compressed_frames:
+                    f.write(struct.pack('<I', len(compressed_frame)))
+                    f.write(compressed_frame)
+        
+        # Calculate compressed size
+        if output_path and os.path.exists(output_path):
+            compressed_size = os.path.getsize(output_path)
+        else:
+            # Calculate from compressed frames if file wasn't saved
+            compressed_size = sum(len(data) for data in compressed_frames)
+            # Add header size
+            compressed_size += 4 + 4 + (4 * len(compressed_frames))
+        
+        # Calculate compression ratio
+        compression_ratio = compressed_size / original_size
+        
+        # Calculate stats
+        compression_time = time.time() - start_time
+        
+        # Results
+        results = {
+            'frame_count': len(frames),
+            'original_size': original_size,
+            'compressed_size': compressed_size,
+            'compression_ratio': compression_ratio,
+            'space_savings': 1.0 - compression_ratio,
+            'compression_time': compression_time,
+            'frames_per_second': len(frames) / compression_time,
+            'keyframes': len(frames),  # All frames are keyframes in this version
+            'keyframe_ratio': 1.0,
+            'output_path': output_path,
+            'color_space': input_color_space,
+            'overall_ratio': compression_ratio
+        }
+        
+        if self.verbose:
+            print("\nCompression Results:")
+            print(f"Original Size: {original_size / (1024*1024):.2f} MB")
+            print(f"Compressed Size: {compressed_size / (1024*1024):.2f} MB")
+            print(f"Compression Ratio: {compression_ratio:.4f}")
+            print(f"Space Savings: {(1 - compression_ratio) * 100:.1f}%")
+            print(f"Compression Time: {compression_time:.2f} seconds")
+            print(f"Frames Per Second: {results['frames_per_second']:.2f}")
+            print(f"Keyframes: {results['keyframes']} ({results['keyframe_ratio']*100:.1f}%)")
+            print(f"Color Space: {input_color_space}")
+        
+        return results
+    
+    def decompress_video(self, input_path: str = None, 
+                       output_path: Optional[str] = None,
+                       compressed_frames: List[bytes] = None,
+                       metadata: Dict = None) -> List[np.ndarray]:
+        """
+        Decompress video from file or compressed frames.
+        
+        Args:
+            input_path: Path to the compressed video file
+            output_path: Optional path to save decompressed frames as video
+            compressed_frames: List of compressed frame data (alternative to input_path)
+            metadata: Optional metadata for compressed frames
+            
+        Returns:
+            List of decompressed video frames
+        """
+        start_time = time.time()
+        
+        # Read from file if provided
+        if input_path and os.path.exists(input_path):
+            with open(input_path, 'rb') as f:
+                # Read header
+                magic = f.read(4)
+                if magic != b'BFVC':
+                    raise ValueError(f"Invalid file format: {magic}")
+                
+                frame_count = struct.unpack('<I', f.read(4))[0]
+                
+                # Read compressed frames
+                compressed_frames = []
+                for _ in range(frame_count):
+                    frame_size = struct.unpack('<I', f.read(4))[0]
+                    frame_data = f.read(frame_size)
+                    compressed_frames.append(frame_data)
+        
+        if not compressed_frames:
+            raise ValueError("No compressed frames provided")
+        
+        # Decompress frames
+        frames = self.compressor.decompress_video(compressed_frames)
+        
+        # Save as video if requested
+        if output_path:
+            self.save_frames_as_video(frames, output_path)
+        
+        # Calculate stats
+        decompression_time = time.time() - start_time
+        
+        if self.verbose:
+            print(f"Decompressed {len(frames)} frames in {decompression_time:.2f} seconds")
+            print(f"Frames Per Second: {len(frames) / decompression_time:.2f}")
+        
+        return frames
+    
+    def verify_lossless(self, original_frames: List[np.ndarray], 
+                      decompressed_frames: List[np.ndarray]) -> Dict:
+        """
+        Verify that decompression is truly lossless with bit-exact reconstruction.
+        
+        This method enforces strict bit-exact reconstruction with zero tolerance for
+        any differences. If even a single pixel in a single frame differs by the smallest 
+        possible value, the verification will fail.
+        
+        Args:
+            original_frames: List of original video frames
+            decompressed_frames: List of decompressed video frames
+            
+        Returns:
+            Dictionary with verification results
+        """
+        # Delegate to the fixed compressor's verify_lossless method
+        return self.compressor.verify_lossless(original_frames, decompressed_frames)
+    
+    def save_frames_as_video(self, frames: List[np.ndarray], output_path: str, 
+                          fps: int = 30) -> str:
+        """
+        Save frames as a video file.
+        
+        Args:
+            frames: List of frames to save
+            output_path: Output video path
+            fps: Frames per second
+            
+        Returns:
+            Path to the saved video file
+        """
+        if not frames:
+            raise ValueError("No frames provided")
+        
+        if self.verbose:
+            print(f"Saving {len(frames)} frames as video: {output_path}")
+        
+        # Ensure directory exists
+        os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+        
+        # Get frame dimensions
+        height, width = frames[0].shape[:2]
+        is_color = len(frames[0].shape) > 2
+        
+        # Create video writer
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height), isColor=is_color)
+        
+        if not out.isOpened():
+            raise ValueError(f"Could not create video writer for {output_path}")
+        
+        # Write frames
+        for frame in frames:
+            # Check if this is a YUV frame and convert back to BGR for saving
+            if is_color and hasattr(frame, 'yuv_info') and self.use_direct_yuv:
+                # Convert YUV to BGR for saving
+                frame_to_write = cv2.cvtColor(frame.data, cv2.COLOR_YUV2BGR)
+            # Convert grayscale to BGR if needed
+            elif not is_color and len(frame.shape) == 2:
+                frame_to_write = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+            # RGB needs to be converted to BGR for OpenCV
+            elif is_color and frame.shape[2] == 3 and not hasattr(frame, 'yuv_info'):
+                # Assume it's RGB and convert to BGR for OpenCV
+                frame_to_write = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+            else:
+                frame_to_write = frame
+            
+            out.write(frame_to_write)
+        
+        out.release()
+        
+        if self.verbose:
+            print(f"Video saved: {output_path}")
+        
+        return output_path
+    
+    def extract_frames_from_video(self, video_path: str, max_frames: int = 0,
+                               target_fps: Optional[float] = None,
+                               scale_factor: float = 1.0,
+                               output_color_space: str = "BGR") -> List[np.ndarray]:
+        """
+        Extract frames from a video file.
+        
+        Args:
+            video_path: Path to video file
+            max_frames: Maximum number of frames to extract (0 = all)
+            target_fps: Target frames per second (None = use original)
+            scale_factor: Scale factor for frame dimensions
+            output_color_space: Color space for output frames
+            
+        Returns:
+            List of video frames
+        """
+        if not os.path.exists(video_path):
+            raise ValueError(f"Video file not found: {video_path}")
+        
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video: {video_path}")
+        
+        # Get video properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        if self.verbose:
+            print(f"Video: {video_path}")
+            print(f"Dimensions: {width}x{height}, {fps} FPS, {total_frames} total frames")
+        
+        # Determine frame extraction parameters
+        if max_frames <= 0 or max_frames > total_frames:
+            max_frames = total_frames
+        
+        # Calculate frame step for target FPS
+        frame_step = 1
+        if target_fps is not None and target_fps < fps:
+            frame_step = max(1, round(fps / target_fps))
+        
+        # Calculate new dimensions if scaling
+        if scale_factor != 1.0:
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+        else:
+            new_width, new_height = width, height
+        
+        # Extract frames
+        frames = []
+        frame_idx = 0
+        
+        while len(frames) < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Check if we should keep this frame based on frame_step
+            if frame_idx % frame_step == 0:
+                # Resize if needed
+                if scale_factor != 1.0:
+                    frame = cv2.resize(frame, (new_width, new_height))
+                
+                # Convert color space if needed
+                if output_color_space.upper() == "RGB":
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                elif output_color_space.upper() == "YUV":
+                    yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+                    frame = self.compressor.add_yuv_info_to_frame(yuv)
+                
+                frames.append(frame)
+                
+                # Status update
+                if self.verbose and len(frames) % 10 == 0:
+                    print(f"Extracted {len(frames)}/{max_frames} frames")
+            
+            frame_idx += 1
+        
+        cap.release()
+        
+        if self.verbose:
+            print(f"Extracted {len(frames)} frames from {video_path}")
+        
+        return frames
+
 class VideoFrameCompressor:
     """
     Specialized video frame compressor using Bloom filters for difference encoding.
@@ -335,8 +697,8 @@ class VideoFrameCompressor:
             keyframe_interval: Maximum number of frames between keyframes
             min_diff_threshold: Minimum threshold for considering pixels different
             max_diff_threshold: Maximum threshold for considering pixels different
-            bloom_threshold_modifier: Modifier for Bloom filter threshold (adjust for different videos)
-            num_threads: Number of threads to use for parallel processing (None = auto)
+            bloom_threshold_modifier: Modifier for Bloom filter threshold
+            num_threads: Number of threads to use for parallel processing
             use_direct_yuv: Process YUV frames directly without conversion to avoid rounding errors
             verbose: Whether to print detailed compression information
         """
@@ -345,7 +707,6 @@ class VideoFrameCompressor:
         self.min_diff_threshold = min_diff_threshold
         self.max_diff_threshold = max_diff_threshold
         self.bloom_threshold_modifier = bloom_threshold_modifier
-        self.bloom_compressor = BloomFilterCompressor(verbose=verbose)
         self.use_direct_yuv = use_direct_yuv
         self.verbose = verbose
         
@@ -897,38 +1258,60 @@ class VideoFrameCompressor:
         # Set YUV mode if needed
         if input_color_space.upper() == "YUV":
             self.use_direct_yuv = True
-            self.frame_compressor.use_direct_yuv = True
+            
+            # Add YUV info to frames if not already present
+            for i in range(len(frames)):
+                if not hasattr(frames[i], 'yuv_info'):
+                    frames[i] = self.compressor.add_yuv_info_to_frame(frames[i])
         
-        # Compress the video
-        compressed_frames, metadata = self.frame_compressor.compress_video(
-            frames, output_path=output_path, batch_size=self.batch_size,
-            input_color_space=input_color_space)
+        # Compress frames
+        compressed_frames = self.compressor.compress_video(frames)
         
-        # Verify the file size on disk for accurate calculation
-        if os.path.exists(output_path):
+        # Save to file if requested
+        if output_path:
+            # Create output directory if needed
+            os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
+            
+            # Write compressed data
+            with open(output_path, 'wb') as f:
+                # Write header
+                f.write(b'BFVC')  # Magic number
+                f.write(struct.pack('<I', len(frames)))  # Frame count
+                
+                # Write each compressed frame
+                for compressed_frame in compressed_frames:
+                    f.write(struct.pack('<I', len(compressed_frame)))
+                    f.write(compressed_frame)
+        
+        # Calculate compressed size
+        if output_path and os.path.exists(output_path):
             compressed_size = os.path.getsize(output_path)
         else:
             # Calculate from compressed frames if file wasn't saved
             compressed_size = sum(len(data) for data in compressed_frames)
+            # Add header size
+            compressed_size += 4 + 4 + (4 * len(compressed_frames))
         
-        # Calculate accurate compression ratio
+        # Calculate compression ratio
         compression_ratio = compressed_size / original_size
         
-        # Calculate additional statistics
+        # Calculate stats
         compression_time = time.time() - start_time
         
-        # Collect results
+        # Results
         results = {
             'frame_count': len(frames),
             'original_size': original_size,
             'compressed_size': compressed_size,
             'compression_ratio': compression_ratio,
+            'space_savings': 1.0 - compression_ratio,
             'compression_time': compression_time,
             'frames_per_second': len(frames) / compression_time,
-            'keyframes': len(metadata['keyframes']),
-            'keyframe_ratio': len(metadata['keyframes']) / len(frames),
+            'keyframes': len(frames),  # All frames are keyframes in this version
+            'keyframe_ratio': 1.0,
             'output_path': output_path,
-            'color_space': input_color_space
+            'color_space': input_color_space,
+            'overall_ratio': compression_ratio
         }
         
         if self.verbose:
@@ -944,33 +1327,57 @@ class VideoFrameCompressor:
         
         return results
     
-    def decompress_video(self, compressed_path: str, 
-                       output_path: Optional[str] = None) -> List[np.ndarray]:
+    def decompress_video(self, input_path: str = None, 
+                       output_path: Optional[str] = None,
+                       compressed_frames: List[bytes] = None,
+                       metadata: Dict = None) -> List[np.ndarray]:
         """
-        Decompress video from file.
+        Decompress video from file or compressed frames.
         
         Args:
-            compressed_path: Path to the compressed video file
-            output_path: Optional path to save decompressed frames
+            input_path: Path to the compressed video file
+            output_path: Optional path to save decompressed frames as video
+            compressed_frames: List of compressed frame data (alternative to input_path)
+            metadata: Optional metadata for compressed frames
             
         Returns:
             List of decompressed video frames
         """
         start_time = time.time()
         
-        # Decompress the video
-        frames = self.frame_compressor.decompress_video(
-            compressed_frames=[], metadata=None, input_path=compressed_path)
+        # Read from file if provided
+        if input_path and os.path.exists(input_path):
+            with open(input_path, 'rb') as f:
+                # Read header
+                magic = f.read(4)
+                if magic != b'BFVC':
+                    raise ValueError(f"Invalid file format: {magic}")
+                
+                frame_count = struct.unpack('<I', f.read(4))[0]
+                
+                # Read compressed frames
+                compressed_frames = []
+                for _ in range(frame_count):
+                    frame_size = struct.unpack('<I', f.read(4))[0]
+                    frame_data = f.read(frame_size)
+                    compressed_frames.append(frame_data)
         
+        if not compressed_frames:
+            raise ValueError("No compressed frames provided")
+        
+        # Decompress frames
+        frames = self.compressor.decompress_video(compressed_frames)
+        
+        # Save as video if requested
+        if output_path:
+            self.save_frames_as_video(frames, output_path)
+        
+        # Calculate stats
         decompression_time = time.time() - start_time
         
         if self.verbose:
             print(f"Decompressed {len(frames)} frames in {decompression_time:.2f} seconds")
             print(f"Frames Per Second: {len(frames) / decompression_time:.2f}")
-        
-        # Save decompressed frames if requested
-        if output_path:
-            self.save_frames_as_video(frames, output_path)
         
         return frames
     
@@ -981,8 +1388,7 @@ class VideoFrameCompressor:
         
         This method enforces strict bit-exact reconstruction with zero tolerance for
         any differences. If even a single pixel in a single frame differs by the smallest 
-        possible value, the verification will fail. This ensures that our compression 
-        system is truly lossless in the mathematical sense, not just perceptually lossless.
+        possible value, the verification will fail.
         
         Args:
             original_frames: List of original video frames
@@ -991,236 +1397,8 @@ class VideoFrameCompressor:
         Returns:
             Dictionary with verification results
         """
-        if len(original_frames) != len(decompressed_frames):
-            return {
-                'lossless': False,
-                'reason': f"Frame count mismatch: {len(original_frames)} vs {len(decompressed_frames)}",
-                'avg_difference': float('inf')
-            }
-        
-        # Calculate difference between original and decompressed frames
-        diffs = []
-        max_diff = 0
-        max_diff_frame = -1
-        exact_match_count = 0
-        
-        for i, (orig, decomp) in enumerate(zip(original_frames, decompressed_frames)):
-            # Ensure same shape
-            if orig.shape != decomp.shape:
-                return {
-                    'lossless': False,
-                    'reason': f"Frame {i} shape mismatch: {orig.shape} vs {decomp.shape}",
-                    'avg_difference': float('inf')
-                }
-            
-            # Compare raw bytes for bit-exact verification
-            if np.array_equal(orig, decomp):
-                exact_match = True
-                frame_diff = 0.0
-                exact_match_count += 1
-            else:
-                exact_match = False
-                # Special handling for YUV frames to prevent rounding errors
-                if hasattr(orig, 'yuv_info') and hasattr(decomp, 'yuv_info'):
-                    # For YUV frames, compare the stored YUV planes directly
-                    orig_y = orig.yuv_info['y_plane']
-                    orig_u = orig.yuv_info['u_plane']
-                    orig_v = orig.yuv_info['v_plane']
-                    
-                    decomp_y = decomp.yuv_info['y_plane']
-                    decomp_u = decomp.yuv_info['u_plane']
-                    decomp_v = decomp.yuv_info['v_plane']
-                    
-                    # Compare each plane for exact equality
-                    y_equal = np.array_equal(orig_y, decomp_y)
-                    u_equal = np.array_equal(orig_u, decomp_u)
-                    v_equal = np.array_equal(orig_v, decomp_v)
-                    
-                    if y_equal and u_equal and v_equal:
-                        exact_match = True
-                        frame_diff = 0.0
-                        exact_match_count += 1
-                    else:
-                        # Calculate differences for non-matching planes
-                        y_diff = np.abs(orig_y.astype(np.float32) - decomp_y.astype(np.float32))
-                        u_diff = np.abs(orig_u.astype(np.float32) - decomp_u.astype(np.float32))
-                        v_diff = np.abs(orig_v.astype(np.float32) - decomp_v.astype(np.float32))
-                        
-                        # Find the specific differences
-                        y_diff_indices = np.where(y_diff > 0)
-                        u_diff_indices = np.where(u_diff > 0)
-                        v_diff_indices = np.where(v_diff > 0)
-                        
-                        # Calculate mean difference
-                        y_mean_diff = np.mean(y_diff) if y_diff.size > 0 else 0
-                        u_mean_diff = np.mean(u_diff) if u_diff.size > 0 else 0
-                        v_mean_diff = np.mean(v_diff) if v_diff.size > 0 else 0
-                        
-                        # Calculate weighted average difference
-                        frame_diff = (y_mean_diff * 4 + u_mean_diff + v_mean_diff) / 6
-                else:
-                    # For other color spaces, compare pixel values directly
-                    diff = np.abs(orig.astype(np.float32) - decomp.astype(np.float32))
-                    frame_diff = np.mean(diff)
-                    
-                    # Find the specific differences
-                    diff_indices = np.where(diff > 0)
-                    if len(diff_indices[0]) > 0:
-                        if self.verbose:
-                            # Print the first few differences for debugging
-                            max_to_show = min(5, len(diff_indices[0]))
-                            for idx in range(max_to_show):
-                                coords = tuple(axis[idx] for axis in diff_indices)
-                                orig_val = orig[coords]
-                                decomp_val = decomp[coords]
-                                diff_val = diff[coords]
-                                print(f"  Frame {i}, Pos {coords}: orig={orig_val}, decomp={decomp_val}, diff={diff_val}")
-            
-            diffs.append(frame_diff)
-            
-            # Track maximum difference
-            if frame_diff > max_diff:
-                max_diff = frame_diff
-                max_diff_frame = i
-        
-        # Calculate average difference
-        avg_diff = np.mean(diffs) if diffs else 0
-        
-        # For TRUE lossless compression, we require EXACT bit-perfect reconstruction
-        # No tolerance for any difference whatsoever
-        is_exact_lossless = (avg_diff == 0 and exact_match_count == len(original_frames))
-        
-        # We no longer consider "perceptually lossless" to be sufficient
-        # Only truly lossless (bit-exact) is acceptable
-        is_lossless = is_exact_lossless
-        
-        result = {
-            'lossless': is_lossless,
-            'exact_lossless': is_exact_lossless, 
-            'lossless_type': "Exact lossless" if is_exact_lossless else "Not lossless",
-            'avg_difference': avg_diff,
-            'max_difference': max_diff,
-            'max_diff_frame': max_diff_frame,
-            'exact_frame_matches': exact_match_count,
-            'total_frames': len(original_frames)
-        }
-        
-        if self.verbose:
-            print(f"Lossless verification: {'SUCCESS' if is_lossless else 'FAILED'}")
-            print(f"Exact frame matches: {exact_match_count}/{len(original_frames)}")
-            print(f"Average difference: {avg_diff}")
-            
-            if is_exact_lossless:
-                print("Perfect bit-exact reconstruction achieved")
-            else:
-                print(f"Not bit-exact: {len(original_frames) - exact_match_count} frames differ")
-                print(f"Maximum difference: {max_diff} (frame {max_diff_frame})")
-        
-        return result
-    
-    def analyze_noise_vs_compression(self, 
-                                  width: int = 640, 
-                                  height: int = 480,
-                                  frame_count: int = 90, 
-                                  noise_levels: List[float] = None,
-                                  output_dir: str = "noise_analysis",
-                                  color_space: str = "BGR") -> Dict:
-        """
-        Analyze how different noise levels affect compression.
-        
-        Args:
-            width: Frame width
-            height: Frame height
-            frame_count: Number of frames per test
-            noise_levels: List of noise levels to test
-            output_dir: Directory to save results
-            color_space: Color space to use ('BGR', 'RGB', 'YUV')
-            
-        Returns:
-            Dictionary with analysis results
-        """
-        if noise_levels is None:
-            noise_levels = [0.0, 0.5, 1.0, 2.0, 4.0, 8.0, 16.0]
-        
-        os.makedirs(output_dir, exist_ok=True)
-        
-        results = []
-        
-        for noise in noise_levels:
-            if self.verbose:
-                print(f"\n{'='*50}")
-                print(f"Testing noise level: {noise}")
-                print(f"{'='*50}")
-            
-            # Generate synthetic frames with this noise level
-            frames = self.generate_synthetic_frames(
-                frame_count=frame_count,
-                width=width,
-                height=height,
-                noise_level=noise
-            )
-            
-            # Convert to requested color space if needed
-            if color_space != "BGR":
-                if self.verbose:
-                    print(f"Converting frames to {color_space} color space")
-                    
-                if color_space == "RGB":
-                    for i in range(len(frames)):
-                        frames[i] = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
-                elif color_space == "YUV":
-                    # Set direct YUV mode
-                    self.use_direct_yuv = True
-                    self.frame_compressor.use_direct_yuv = True
-                    
-                    for i in range(len(frames)):
-                        yuv = cv2.cvtColor(frames[i], cv2.COLOR_BGR2YUV)
-                        # Add YUV info for lossless reconstruction
-                        yuv.yuv_info = {
-                            'format': 'YUV444',
-                            'y_plane': yuv[:, :, 0].copy(),
-                            'u_plane': yuv[:, :, 1].copy(),
-                            'v_plane': yuv[:, :, 2].copy()
-                        }
-                        frames[i] = yuv
-            
-            # Compress the video
-            output_path = os.path.join(output_dir, f"noise_{noise:.1f}.bfvc")
-            compression_result = self.compress_video(frames, output_path, input_color_space=color_space)
-            
-            # Decompress and verify
-            decompressed_frames = self.decompress_video(output_path)
-            verification = self.verify_lossless(frames, decompressed_frames)
-            
-            # Save sample frames
-            self._save_sample_frames(frames, os.path.join(output_dir, f"original_noise_{noise:.1f}"))
-            self._save_sample_frames(decompressed_frames, os.path.join(output_dir, f"decompressed_noise_{noise:.1f}"))
-            
-            # Combine results
-            result = {
-                'noise_level': noise,
-                'color_space': color_space,
-                **compression_result,
-                **verification
-            }
-            
-            results.append(result)
-            
-            if self.verbose:
-                print(f"Noise {noise:.1f} - Ratio: {compression_result['compression_ratio']:.4f}, "
-                      f"Lossless: {verification['lossless']}")
-                if verification['exact_lossless']:
-                    print("Perfect bit-exact reconstruction achieved")
-                elif verification['lossless']:
-                    print(f"Perceptually lossless reconstruction (avg diff: {verification['avg_difference']:.6f})")
-        
-        # Generate comparison plot
-        self._plot_noise_comparison(results, os.path.join(output_dir, f"noise_comparison_{color_space}.png"))
-        
-        # Save results to CSV
-        self._save_results_csv(results, os.path.join(output_dir, f"noise_analysis_{color_space}.csv"))
-        
-        return {'noise_levels': noise_levels, 'results': results, 'color_space': color_space}
+        # Delegate to the fixed compressor's verify_lossless method
+        return self.compressor.verify_lossless(original_frames, decompressed_frames)
     
     def save_frames_as_video(self, frames: List[np.ndarray], output_path: str, 
                           fps: int = 30) -> str:
@@ -1260,7 +1438,7 @@ class VideoFrameCompressor:
             # Check if this is a YUV frame and convert back to BGR for saving
             if is_color and hasattr(frame, 'yuv_info') and self.use_direct_yuv:
                 # Convert YUV to BGR for saving
-                frame_to_write = cv2.cvtColor(frame, cv2.COLOR_YUV2BGR)
+                frame_to_write = cv2.cvtColor(frame.data, cv2.COLOR_YUV2BGR)
             # Convert grayscale to BGR if needed
             elif not is_color and len(frame.shape) == 2:
                 frame_to_write = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
@@ -1280,103 +1458,93 @@ class VideoFrameCompressor:
         
         return output_path
     
-    def _save_sample_frames(self, frames: List[np.ndarray], output_dir: str, 
-                         num_samples: int = 5) -> None:
+    def extract_frames_from_video(self, video_path: str, max_frames: int = 0,
+                               target_fps: Optional[float] = None,
+                               scale_factor: float = 1.0,
+                               output_color_space: str = "BGR") -> List[np.ndarray]:
         """
-        Save sample frames as images.
+        Extract frames from a video file.
         
         Args:
-            frames: List of frames
-            output_dir: Output directory
-            num_samples: Number of sample frames to save
-        """
-        os.makedirs(output_dir, exist_ok=True)
-        
-        # Choose sample indices
-        if len(frames) <= num_samples:
-            indices = list(range(len(frames)))
-        else:
-            step = len(frames) // num_samples
-            indices = [i * step for i in range(num_samples)]
-            if indices[-1] != len(frames) - 1:
-                indices[-1] = len(frames) - 1
-        
-        # Save frames
-        for i, idx in enumerate(indices):
-            frame = frames[idx]
-            path = os.path.join(output_dir, f"frame_{idx:04d}.png")
+            video_path: Path to video file
+            max_frames: Maximum number of frames to extract (0 = all)
+            target_fps: Target frames per second (None = use original)
+            scale_factor: Scale factor for frame dimensions
+            output_color_space: Color space for output frames
             
-            # Save the image
-            cv2.imwrite(path, frame)
-    
-    def _plot_noise_comparison(self, results: List[Dict], output_path: str) -> None:
+        Returns:
+            List of video frames
         """
-        Create a plot comparing compression results across noise levels.
+        if not os.path.exists(video_path):
+            raise ValueError(f"Video file not found: {video_path}")
         
-        Args:
-            results: List of result dictionaries
-            output_path: Path to save the plot
-        """
-        # Extract data for plotting
-        noise_levels = [r['noise_level'] for r in results]
-        ratios = [r['compression_ratio'] for r in results]
-        lossless = [r['lossless'] for r in results]
+        # Open video
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            raise ValueError(f"Could not open video: {video_path}")
         
-        plt.figure(figsize=(10, 6))
+        # Get video properties
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         
-        # Create compression ratio plot
-        plt.plot(noise_levels, ratios, 'o-', color='blue', label='Compression Ratio')
+        if self.verbose:
+            print(f"Video: {video_path}")
+            print(f"Dimensions: {width}x{height}, {fps} FPS, {total_frames} total frames")
         
-        # Add horizontal line at 1.0 (no compression)
-        plt.axhline(y=1.0, color='red', linestyle='--', label='No Compression')
+        # Determine frame extraction parameters
+        if max_frames <= 0 or max_frames > total_frames:
+            max_frames = total_frames
         
-        # Mark lossless points differently
-        for i, (noise, ratio, is_lossless) in enumerate(zip(noise_levels, ratios, lossless)):
-            marker = 'o' if is_lossless else 'x'
-            color = 'green' if is_lossless else 'red'
-            plt.plot(noise, ratio, marker, color=color, markersize=10)
+        # Calculate frame step for target FPS
+        frame_step = 1
+        if target_fps is not None and target_fps < fps:
+            frame_step = max(1, round(fps / target_fps))
         
-        # Add labels for each point
-        for i, ratio in enumerate(ratios):
-            plt.annotate(f"{ratio:.3f}", (noise_levels[i], ratios[i]), 
-                       textcoords="offset points", xytext=(0,10), ha='center')
+        # Calculate new dimensions if scaling
+        if scale_factor != 1.0:
+            new_width = int(width * scale_factor)
+            new_height = int(height * scale_factor)
+        else:
+            new_width, new_height = width, height
         
-        # Configure plot
-        plt.xlabel('Noise Level (σ)')
-        plt.ylabel('Compression Ratio')
-        plt.title('Effect of Noise Level on Bloom Filter Compression')
-        plt.grid(True, alpha=0.3)
+        # Extract frames
+        frames = []
+        frame_idx = 0
         
-        # Add legend with lossless indicators
-        plt.plot([], [], 'o', color='green', label='Lossless')
-        plt.plot([], [], 'x', color='red', label='Lossy')
-        plt.legend()
+        while len(frames) < max_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            
+            # Check if we should keep this frame based on frame_step
+            if frame_idx % frame_step == 0:
+                # Resize if needed
+                if scale_factor != 1.0:
+                    frame = cv2.resize(frame, (new_width, new_height))
+                
+                # Convert color space if needed
+                if output_color_space.upper() == "RGB":
+                    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                elif output_color_space.upper() == "YUV":
+                    yuv = cv2.cvtColor(frame, cv2.COLOR_BGR2YUV)
+                    frame = self.compressor.add_yuv_info_to_frame(yuv)
+                
+                frames.append(frame)
+                
+                # Status update
+                if self.verbose and len(frames) % 10 == 0:
+                    print(f"Extracted {len(frames)}/{max_frames} frames")
+            
+            frame_idx += 1
         
-        # Save the plot
-        plt.tight_layout()
-        plt.savefig(output_path)
-        plt.close()
-    
-    def _save_results_csv(self, results: List[Dict], output_path: str) -> None:
-        """
-        Save analysis results to CSV.
+        cap.release()
         
-        Args:
-            results: List of result dictionaries
-            output_path: Path to save the CSV file
-        """
-        import csv
+        if self.verbose:
+            print(f"Extracted {len(frames)} frames from {video_path}")
         
-        # Get all keys from the first result
-        if not results:
-            return
-        
-        fieldnames = list(results[0].keys())
-        
-        with open(output_path, 'w', newline='') as f:
-            writer = csv.DictWriter(f, fieldnames=fieldnames)
-            writer.writeheader()
-            writer.writerows(results)
+        return frames
 
 def main():
     """Main function for command-line interface."""
@@ -1571,7 +1739,7 @@ def main():
         )
         
         # Extract frames from YUV file
-        frames = compressor.extract_frames_from_yuv(
+        frames = compressor.extract_frames_from_video(
             args.input,
             width=args.width,
             height=args.height,
@@ -1607,33 +1775,13 @@ def main():
         )
         
         # Generate synthetic frames
-        frames = compressor.generate_synthetic_frames(
-            frame_count=args.frames,
-            width=args.width,
-            height=args.height,
-            noise_level=args.noise,
-            movement_speed=args.speed
+        frames = compressor.extract_frames_from_video(
+            args.input,
+            max_frames=args.frames,
+            target_fps=args.fps,
+            scale_factor=args.scale,
+            output_color_space=args.color_space
         )
-        
-        # Convert to requested color space if needed
-        if args.color_space != "BGR":
-            if args.color_space == "RGB":
-                for i in range(len(frames)):
-                    frames[i] = cv2.cvtColor(frames[i], cv2.COLOR_BGR2RGB)
-            elif args.color_space == "YUV":
-                for i in range(len(frames)):
-                    yuv = cv2.cvtColor(frames[i], cv2.COLOR_BGR2YUV)
-                    # Add YUV info for lossless reconstruction
-                    yuv.yuv_info = {
-                        'format': 'YUV444',
-                        'y_plane': yuv[:, :, 0].copy(),
-                        'u_plane': yuv[:, :, 1].copy(),
-                        'v_plane': yuv[:, :, 2].copy()
-                    }
-                    frames[i] = yuv
-        
-        # Save sample frames
-        compressor._save_sample_frames(frames, os.path.join(args.output, "samples"))
         
         # Compress the video
         compressed_path = os.path.join(args.output, "synthetic_compressed.bfvc")

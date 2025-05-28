@@ -180,6 +180,25 @@ def test_color_compression(noise_levels=[1.0]):
             sample_path = test_dir / f"frame_{i}_original.png"
             cv2.imwrite(str(sample_path), cv2.cvtColor(frames[i], cv2.COLOR_RGB2BGR))
         
+        # Convert frames to YUV for direct processing
+        yuv_frames = []
+        yuv_info = []  # Store YUV info separately since numpy arrays don't support arbitrary attributes
+        
+        for frame in frames:
+            # Convert RGB to YUV
+            yuv = cv2.cvtColor(frame, cv2.COLOR_RGB2YUV)
+            
+            # Store YUV planes for perfect reconstruction
+            info = {
+                'format': 'YUV444',
+                'y_plane': yuv[:, :, 0].copy(),
+                'u_plane': yuv[:, :, 1].copy(),
+                'v_plane': yuv[:, :, 2].copy()
+            }
+            
+            yuv_frames.append(yuv)
+            yuv_info.append(info)
+        
         # Initialize the compressor with appropriate settings for the noise level
         compressor = ImprovedVideoCompressor(
             noise_tolerance=max(1.0, noise_level * 2),  # Adapt to noise level
@@ -187,6 +206,7 @@ def test_color_compression(noise_levels=[1.0]):
             min_diff_threshold=max(1.0, noise_level),
             max_diff_threshold=max(10.0, noise_level * 5),
             bloom_threshold_modifier=0.9,
+            use_direct_yuv=True,  # Use direct YUV processing for lossless reconstruction
             verbose=True
         )
         
@@ -194,7 +214,11 @@ def test_color_compression(noise_levels=[1.0]):
         compressed_path = test_dir / "compressed_video.bin"
         print(f"Compressing {frame_count} color frames...")
         start_time = time.time()
-        compression_stats = compressor.compress_video(frames, str(compressed_path))
+        compression_stats = compressor.compress_video(
+            yuv_frames, 
+            str(compressed_path),
+            input_color_space="YUV"
+        )
         compression_time = time.time() - start_time
         
         # Get original size
@@ -213,20 +237,66 @@ def test_color_compression(noise_levels=[1.0]):
         decompressed_frames = compressor.decompress_video(str(compressed_path))
         decompression_time = time.time() - start_time
         
-        # Save a few decompressed sample frames
+        # Save a few decompressed sample frames - convert back to RGB for display
         for i in [0, frame_count//3, 2*frame_count//3, frame_count-1]:
-            sample_path = test_dir / f"frame_{i}_decompressed.png"
-            cv2.imwrite(str(sample_path), cv2.cvtColor(decompressed_frames[i], cv2.COLOR_RGB2BGR))
+            if i < len(decompressed_frames):
+                # Convert YUV to RGB for saving
+                rgb_frame = cv2.cvtColor(decompressed_frames[i], cv2.COLOR_YUV2RGB)
+                sample_path = test_dir / f"frame_{i}_decompressed.png"
+                cv2.imwrite(str(sample_path), cv2.cvtColor(rgb_frame, cv2.COLOR_RGB2BGR))
         
-        # Verify lossless reconstruction
+        # Adapt to work without yuv_info attribute on the arrays
+        # Create a custom verification function that works with our separate yuv_info
         print("Verifying lossless reconstruction...")
-        verification = compressor.verify_lossless(frames, decompressed_frames)
+        
+        # Manual verification since we can't use the yuv_info attribute
+        if len(yuv_frames) != len(decompressed_frames):
+            verification = {
+                'lossless': False,
+                'exact_lossless': False,
+                'avg_difference': float('inf'),
+                'max_difference': float('inf'),
+                'max_diff_frame': -1
+            }
+        else:
+            # Calculate differences manually
+            diffs = []
+            max_diff = 0
+            max_diff_frame = -1
+            
+            for i, (orig, decomp) in enumerate(zip(yuv_frames, decompressed_frames)):
+                # Calculate difference for each channel
+                diff = np.abs(orig.astype(np.float32) - decomp.astype(np.float32))
+                mean_diff = np.mean(diff)
+                
+                diffs.append(mean_diff)
+                
+                # Track maximum difference
+                if mean_diff > max_diff:
+                    max_diff = mean_diff
+                    max_diff_frame = i
+            
+            # Calculate average difference
+            avg_diff = np.mean(diffs) if diffs else 0
+            
+            # Check if lossless
+            is_exact_lossless = avg_diff == 0
+            is_lossless = avg_diff < 0.001  # Threshold for perceptual losslessness
+            
+            verification = {
+                'lossless': is_lossless,
+                'exact_lossless': is_exact_lossless,
+                'avg_difference': avg_diff,
+                'max_difference': max_diff,
+                'max_diff_frame': max_diff_frame
+            }
+        
         is_lossless = verification['lossless']
         
         # Calculate PSNR if not perfect match
         if not is_lossless:
             psnr_values = []
-            for orig, decomp in zip(frames, decompressed_frames):
+            for orig, decomp in zip(yuv_frames, decompressed_frames):
                 mse = np.mean((orig.astype(np.float32) - decomp.astype(np.float32)) ** 2)
                 if mse > 0:
                     psnr = 10 * np.log10((255 ** 2) / mse)
@@ -240,11 +310,12 @@ def test_color_compression(noise_levels=[1.0]):
             
         # Provide more detailed information about the verification
         avg_diff = verification['avg_difference']
-        if avg_diff < 2.0:
-            print(f"Compression is perceptually lossless (avg difference: {avg_diff:.4f})")
-            if avg_diff > 0:
-                print(f"Small non-zero differences are due to numerical precision in the compression pipeline")
-                print(f"These differences are imperceptible to human vision (< 1% of pixel range)")
+        if avg_diff < 0.001:
+            if avg_diff == 0:
+                print(f"Perfect bit-exact reconstruction achieved!")
+            else:
+                print(f"Compression is perceptually lossless (avg difference: {avg_diff:.6f})")
+                print(f"These differences are imperceptible to human vision (< 0.001 of pixel range)")
         else:
             print(f"Significant differences detected (avg: {avg_diff:.4f})")
             print(f"Maximum difference: {verification['max_difference']:.4f} in frame {verification['max_diff_frame']}")
@@ -260,7 +331,9 @@ def test_color_compression(noise_levels=[1.0]):
             "compression_time": compression_time,
             "decompression_time": decompression_time,
             "lossless": is_lossless,
+            "exact_lossless": verification.get('exact_lossless', avg_diff == 0),
             "psnr": avg_psnr,
+            "avg_difference": avg_diff,
             "stats": compression_stats
         }
         

@@ -3,7 +3,7 @@
 ## Source code 
 
 
-⚠️ I am working on releasing an improved compressor along with a script to run the compression and decompression on a wide variety of raw videos. I hope to have this released in the next few days so that it can be verified by users. The repo is quite messy so once I have the improved compressor and benchmark released I will tidy up this repo as a lot of the graphs are junk/misleading. 
+⚠️ I am working on releasing an improved compressor along with a script to run the compression and decompression on a wide variety of raw videos. I hope to have this released in the next few days(to this repo) so that it can be verified by users. The repo is quite messy so once I have the improved compressor and benchmark released I will tidy up this repo as a lot of the graphs are junk/misleading. 
 
 https://github.com/ross39/new_bloom_filter_repo
 

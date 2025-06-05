@@ -109,3 +109,4 @@ temp_youtube_downloads/
 test_output/temp/
 # Exclude all MP4 files
 *.mp4
+*/
